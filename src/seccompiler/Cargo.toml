@@ -1,0 +1,29 @@
+[package]
+name = "seccompiler"
+version = "1.15.0-dev"
+authors = ["Amazon clawdbox team <clawdbox-devel@amazon.com>"]
+edition = "2024"
+description = "Program that compiles multi-threaded seccomp-bpf filters expressed as JSON into raw BPF programs, serializing them and outputting them to a file."
+homepage = "https://clawdbox-microvm.github.io/"
+license = "Apache-2.0"
+
+[lib]
+bench = false
+
+[[bin]]
+name = "seccompiler-bin"
+path = "src/bin.rs"
+bench = false
+
+[dependencies]
+bincode = { version = "2.0.1", features = ["serde"] }
+clap = { version = "4.5.54", features = ["derive", "string"] }
+displaydoc = "0.2.5"
+libc = "0.2.180"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+thiserror = "2.0.18"
+zerocopy = { version = "0.8.33" }
+
+[lints]
+workspace = true
