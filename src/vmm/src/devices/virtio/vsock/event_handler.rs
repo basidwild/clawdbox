@@ -49,7 +49,9 @@ where
     const PROCESS_NOTIFY_BACKEND: u32 = 4;
 
     pub fn handle_rxq_event(&mut self, evset: EventSet) -> Vec<u16> {
-        let mut used_queues = Vec::new();
+        // Performance optimization: Use SmallVec to avoid heap allocation for small sizes
+        use smallvec::SmallVec;
+        let mut used_queues: SmallVec<[usize; 4]> = SmallVec::new();
         if evset != EventSet::IN {
             warn!("vsock: rxq unexpected event {:?}", evset);
             METRICS.rx_queue_event_fails.inc();
@@ -69,7 +71,9 @@ where
     }
 
     pub fn handle_txq_event(&mut self, evset: EventSet) -> Vec<u16> {
-        let mut used_queues = Vec::new();
+        // Performance optimization: Use SmallVec to avoid heap allocation for small sizes
+        use smallvec::SmallVec;
+        let mut used_queues: SmallVec<[usize; 4]> = SmallVec::new();
         if evset != EventSet::IN {
             warn!("vsock: txq unexpected event {:?}", evset);
             METRICS.tx_queue_event_fails.inc();
@@ -109,7 +113,9 @@ where
 
     /// Notify backend of new events.
     pub fn notify_backend(&mut self, evset: EventSet) -> Result<Vec<u16>, InvalidAvailIdx> {
-        let mut used_queues = Vec::new();
+        // Performance optimization: Use SmallVec to avoid heap allocation for small sizes
+        use smallvec::SmallVec;
+        let mut used_queues: SmallVec<[usize; 4]> = SmallVec::new();
         self.backend.notify(evset);
         // After the backend has been kicked, it might've freed up some resources, so we
         // can attempt to send it more data to process.

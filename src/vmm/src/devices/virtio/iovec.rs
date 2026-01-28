@@ -67,6 +67,25 @@ impl IoVecBuffer {
                 return Err(IoVecError::WriteOnlyDescriptor);
             }
 
+            // Performance optimization: Prefetch next descriptor to reduce cache misses
+            #[cfg(target_arch = "x86_64")]
+            if let Some(next_desc) = desc.next_descriptor() {
+                // Prefetch the next descriptor's memory region for reading
+                // This is safe because we're just giving the CPU a hint; 
+                // actual access validation happens in next iteration
+                unsafe {
+                    use core::arch::x86_64::_mm_prefetch;
+                    const _MM_HINT_T0: i32 = 3;  // Prefetch to all cache levels
+                    let next_addr = mem
+                        .get_slice(next_desc.addr, 1)
+                        .map(|s| s.ptr_guard().as_ptr())
+                        .unwrap_or(std::ptr::null());
+                    if !next_addr.is_null() {
+                        _mm_prefetch(next_addr.cast::<i8>(), _MM_HINT_T0);
+                    }
+                }
+            }
+
             // We use get_slice instead of `get_host_address` here in order to have the whole
             // range of the descriptor chain checked, i.e. [addr, addr + len) is a valid memory
             // region in the GuestMemoryMmap.

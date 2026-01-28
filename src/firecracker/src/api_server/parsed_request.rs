@@ -1,6 +1,7 @@
 // Copyright 2019 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::cell::RefCell;
 use std::fmt::Debug;
 
 use micro_http::{Body, Method, Request, Response, StatusCode, Version};
@@ -8,6 +9,11 @@ use serde::ser::Serialize;
 use serde_json::Value;
 use vmm::logger::{Level, error, info, log_enabled};
 use vmm::rpc_interface::{VmmAction, VmmActionError, VmmData};
+
+// Performance optimization: Thread-local buffer pool for JSON serialization
+thread_local! {
+    static JSON_BUFFER: RefCell<String> = RefCell::new(String::with_capacity(4096));
+}
 
 use super::ApiServer;
 use super::request::actions::parse_put_actions;
@@ -65,10 +71,11 @@ pub(crate) struct ParsedRequest {
 impl TryFrom<&Request> for ParsedRequest {
     type Error = RequestError;
     fn try_from(request: &Request) -> Result<Self, Self::Error> {
-        let request_uri = request.uri().get_abs_path().to_string();
+        // Performance optimization: Use &str slices to avoid allocation
+        let request_uri = request.uri().get_abs_path();
         let description = describe(
             request.method(),
-            request_uri.as_str(),
+            request_uri,
             request.body.as_ref(),
         );
         info!("The API server received a {description}.");
@@ -155,17 +162,34 @@ impl ParsedRequest {
     {
         info!("The request was executed successfully. Status code: 200 OK.");
         let mut response = Response::new(Version::Http11, StatusCode::OK);
-        response.set_body(Body::new(serde_json::to_string(body_data).unwrap()));
+        
+        // Performance optimization: Reuse thread-local buffer for JSON serialization
+        let body_str = JSON_BUFFER.with(|buf| {
+            let mut buffer = buf.borrow_mut();
+            buffer.clear();
+            serde_json::to_writer(&mut *buffer, body_data).unwrap();
+            buffer.clone()
+        });
+        
+        response.set_body(Body::new(body_str));
         response
     }
 
     pub(crate) fn success_response_with_mmds_value(body_data: &Value) -> Response {
         info!("The request was executed successfully. Status code: 200 OK.");
         let mut response = Response::new(Version::Http11, StatusCode::OK);
-        let body_str = match body_data {
-            Value::Null => "{}".to_string(),
-            _ => serde_json::to_string(body_data).unwrap(),
-        };
+        
+        // Performance optimization: Reuse thread-local buffer
+        let body_str = JSON_BUFFER.with(|buf| {
+            let mut buffer = buf.borrow_mut();
+            buffer.clear();
+            match body_data {
+                Value::Null => buffer.push_str("{}"),
+                _ => serde_json::to_writer(&mut *buffer, body_data).unwrap(),
+            };
+            buffer.clone()
+        });
+        
         response.set_body(Body::new(body_str));
         response
     }

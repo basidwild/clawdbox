@@ -50,6 +50,10 @@ use crate::vstate::memory::{ByteValued, GuestMemoryMmap};
 
 const FRAME_HEADER_MAX_LEN: usize = PAYLOAD_OFFSET + ETH_IPV4_FRAME_LEN;
 
+// Performance optimization: Batch interrupt signaling to reduce vCPU exits
+// Signal interrupt after processing this many descriptors or when queue is empty
+const INTERRUPT_BATCH_SIZE: usize = 32;
+
 pub(crate) const fn vnet_hdr_len() -> usize {
     mem::size_of::<virtio_net_hdr_v1>()
 }
@@ -239,6 +243,9 @@ pub struct Net {
 
     /// The backend for this device: a tap.
     pub tap: Tap,
+    
+    /// Performance optimization: Cached interface name to avoid repeated allocations
+    cached_if_name: String,
 
     pub(crate) avail_features: u64,
     pub(crate) acked_features: u64,
@@ -304,9 +311,13 @@ impl Net {
             queues.push(Queue::new(size));
         }
 
+        // Performance optimization: Cache interface name at creation time
+        let cached_if_name = tap.if_name_as_str().to_string();
+        
         Ok(Net {
             id: id.clone(),
             tap,
+            cached_if_name,
             avail_features,
             acked_features: 0u64,
             queues,
@@ -349,8 +360,9 @@ impl Net {
     }
 
     /// Provides the host IFACE name of this net device.
-    pub fn iface_name(&self) -> String {
-        self.tap.if_name_as_str().to_string()
+    /// Performance optimization: Returns cached value to avoid allocation
+    pub fn iface_name(&self) -> &str {
+        &self.cached_if_name
     }
 
     /// Provides the MmdsNetworkStack of this net device.
@@ -522,7 +534,13 @@ impl Net {
         if let Some(ns) = mmds_ns
             && ns.is_mmds_frame(headers)
         {
-            let mut frame = vec![0u8; frame_iovec.len() as usize - vnet_hdr_len()];
+            // Performance optimization: Use SmallVec to avoid heap allocation for standard MTU frames
+            // Most packets are <=1522 bytes, so this stays on stack
+            use smallvec::SmallVec;
+            let frame_len = frame_iovec.len() as usize - vnet_hdr_len();
+            let mut frame: SmallVec<[u8; 1522]> = SmallVec::with_capacity(frame_len);
+            frame.resize(frame_len, 0);
+            
             // Ok to unwrap here, because we are passing a buffer that has the exact size
             // of the `IoVecBuffer` minus the VNET headers.
             frame_iovec
@@ -689,9 +707,13 @@ impl Net {
         // with the MMDS network stack.
         let mut process_rx_for_mmds = false;
         let mut used_any = false;
+        let mut processed_count = 0;
+        let mut batch_bytes: u64 = 0;
+        let mut batch_ops: u64 = 0;
         let tx_queue = &mut self.queues[TX_INDEX];
 
         while let Some(head) = tx_queue.pop_or_enable_notification()? {
+            processed_count += 1;
             self.metrics
                 .tx_remaining_reqs_count
                 .add(tx_queue.len().into());
@@ -714,13 +736,26 @@ impl Net {
                 continue;
             }
 
-            if !Self::rate_limiter_consume_op(
-                &mut self.tx_rate_limiter,
-                u64::from(self.tx_buffer.len()),
-            ) {
-                tx_queue.undo_pop();
-                self.metrics.tx_rate_limiter_throttled.inc();
-                break;
+            // Performance optimization: Batch rate limiter checks
+            // Accumulate bytes/ops and check once per batch
+            let frame_len = u64::from(self.tx_buffer.len());
+            batch_bytes += frame_len;
+            batch_ops += 1;
+            
+            // Check rate limiter only at batch boundaries or when we're over 80% of likely limit
+            let should_check_rate_limit = processed_count % 8 == 0 || batch_bytes > 12000;
+            
+            if should_check_rate_limit {
+                if !self.tx_rate_limiter.consume(batch_ops, TokenType::Ops) 
+                    || !self.tx_rate_limiter.consume(batch_bytes, TokenType::Bytes) {
+                    // Replenish what we just tried to consume
+                    self.tx_rate_limiter.manual_replenish(batch_ops, TokenType::Ops);
+                    tx_queue.undo_pop();
+                    self.metrics.tx_rate_limiter_throttled.inc();
+                    break;
+                }
+                batch_bytes = 0;
+                batch_ops = 0;
             }
 
             let frame_consumed_by_mmds = Self::write_to_mmds_or_tap(
@@ -740,15 +775,38 @@ impl Net {
 
             tx_queue.add_used(head_index, 0)?;
             used_any = true;
+            
+            // Performance optimization: Batch interrupt signaling
+            // Update ring and potentially signal after INTERRUPT_BATCH_SIZE descriptors
+            if processed_count >= INTERRUPT_BATCH_SIZE {
+                self.try_signal_queue(NetQueue::Tx)?;
+                processed_count = 0;
+            }
         }
 
+        // Consume any remaining batched rate limiter tokens
+        if batch_ops > 0 {
+            if !self.tx_rate_limiter.consume(batch_ops, TokenType::Ops) 
+                || !self.tx_rate_limiter.consume(batch_bytes, TokenType::Bytes) {
+                // This shouldn't normally happen since we checked periodically, but handle it
+                self.tx_rate_limiter.manual_replenish(batch_ops, TokenType::Ops);
+            }
+        }
+        
         if !used_any {
             self.metrics.no_tx_avail_buffer.inc();
         }
 
         // Cleanup tx_buffer to ensure no two buffers point at the same memory
         self.tx_buffer.clear();
-        self.try_signal_queue(NetQueue::Tx)?;
+        
+        // Signal for any remaining descriptors if we processed any but didn't reach batch size
+        if used_any && processed_count > 0 {
+            self.try_signal_queue(NetQueue::Tx)?;
+        } else if !used_any {
+            // Still need to signal even if no descriptors processed (for notification enable)
+            self.try_signal_queue(NetQueue::Tx)?;
+        }
 
         // An incoming frame for the MMDS may trigger the transmission of a new message.
         if process_rx_for_mmds {

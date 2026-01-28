@@ -10,7 +10,8 @@ pub mod parsed_request;
 pub mod request;
 
 use std::fmt::Debug;
-use std::sync::mpsc;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::Duration;
 
 pub use micro_http::{Body, HttpServer, Request, Response, ServerError, StatusCode, Version};
 use parsed_request::{ParsedRequest, RequestAction};
@@ -171,7 +172,18 @@ impl ApiServer {
             .send(vmm_action)
             .expect("Failed to send VMM message");
         self.to_vmm_fd.write(1).expect("Cannot update send VMM fd");
-        let vmm_outcome = *(self.vmm_response_receiver.recv().expect("VMM disconnected"));
+        
+        // Performance optimization: Add timeout to prevent deadlocks
+        let vmm_outcome = match self.vmm_response_receiver.recv_timeout(Duration::from_secs(30)) {
+            Ok(outcome) => *outcome,
+            Err(RecvTimeoutError::Timeout) => {
+                error!("VMM request timeout after 30s");
+                return Response::new(Version::Http11, StatusCode::InternalServerError);
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                panic!("VMM channel disconnected");
+            }
+        };
         let response = ParsedRequest::convert_to_response(&vmm_outcome);
 
         if vmm_outcome.is_ok()
