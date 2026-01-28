@@ -30,12 +30,20 @@ const FC_ACPI_CREATOR_ID: [u8; 4] = *b"FCAT";
 // crate.
 const FC_ACPI_CREATOR_REVISION: u32 = 0x20240119;
 
+/// Calculate ACPI checksum for the given byte slices
+///
+/// The checksum is calculated such that the sum of all bytes including
+/// the checksum byte equals zero when wrapped in u8 arithmetic.
+///
+/// # Performance
+/// Optimized to minimize iterator overhead and use efficient wrapping arithmetic
+#[inline]
 fn checksum(buf: &[&[u8]]) -> u8 {
-    (255 - buf
+    let sum = buf
         .iter()
-        .flat_map(|b| b.iter())
-        .fold(0u8, |acc, x| acc.wrapping_add(*x)))
-    .wrapping_add(1)
+        .flat_map(|slice| slice.iter().copied())
+        .fold(0u8, u8::wrapping_add);
+    sum.wrapping_neg()
 }
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -48,16 +56,36 @@ pub enum AcpiError {
     InvalidRegisterSize,
 }
 
+/// Result type for ACPI operations
 pub type Result<T> = std::result::Result<T, AcpiError>;
 
-/// ACPI type representing memory addresses
+/// Generic Address Structure (GAS) - ACPI type representing memory/IO addresses
+///
+/// This structure is used throughout ACPI tables to describe register locations
+/// in various address spaces (System Memory, System I/O, PCI Configuration Space, etc.)
+///
+/// # Layout
+/// The structure is packed (no padding) and follows the ACPI specification exactly.
+///
+/// # Examples
+/// ```ignore
+/// use acpi_tables::GenericAddressStructure;
+///
+/// // System Memory address at 0x1000
+/// let gas = GenericAddressStructure::new(0, 32, 0, 3, 0x1000);
+/// ```
 #[repr(C, packed)]
 #[derive(IntoBytes, Immutable, Clone, Copy, Debug, Default)]
 pub struct GenericAddressStructure {
+    /// Address space where the register exists (0=System Memory, 1=System I/O, etc.)
     pub address_space_id: u8,
+    /// Size in bits of the register
     pub register_bit_width: u8,
+    /// Bit offset of the register within the address
     pub register_bit_offset: u8,
+    /// Access size (0=Undefined, 1=Byte, 2=Word, 3=DWord, 4=QWord)
     pub access_size: u8,
+    /// 64-bit address of the register
     pub address: U64,
 }
 
@@ -79,18 +107,37 @@ impl GenericAddressStructure {
     }
 }
 
-/// Header included in all System Descriptor Tables
+/// System Descriptor Table Header
+///
+/// This is the standard header included at the beginning of all ACPI System Descriptor Tables
+/// (XSDT, FADT, MADT, etc.). It contains table identification and checksum information.
+///
+/// # Layout
+/// The structure is packed (36 bytes) and follows the ACPI specification.
+///
+/// # Checksum
+/// The checksum byte is calculated such that the sum of all bytes in the entire table
+/// (including this header) equals zero when wrapped in u8 arithmetic.
 #[repr(C, packed)]
 #[derive(Clone, Debug, Copy, Default, IntoBytes, Immutable)]
 pub struct SdtHeader {
+    /// Table signature (e.g., b"XSDT", b"FACP", b"APIC")
     pub signature: [u8; 4],
+    /// Length of the entire table including this header
     pub length: U32,
+    /// Table revision number
     pub revision: u8,
+    /// Checksum of entire table (sum of all bytes = 0)
     pub checksum: u8,
+    /// OEM-supplied string that identifies the OEM
     pub oem_id: [u8; 6],
+    /// OEM-supplied string that identifies the specific data table
     pub oem_table_id: [u8; 8],
+    /// OEM-supplied revision number
     pub oem_revision: U32,
+    /// Vendor ID of utility that created the table
     pub creator_id: [u8; 4],
+    /// Revision of utility that created the table
     pub creator_revision: U32,
 }
 
@@ -117,17 +164,34 @@ impl SdtHeader {
     }
 }
 
-/// A trait for functionality around System Descriptor Tables.
+/// Trait for ACPI System Descriptor Table operations
+///
+/// This trait provides a common interface for all ACPI tables (XSDT, FADT, MADT, etc.)
+/// allowing them to be written to guest memory and queried for their size.
+///
+/// # Implementation Note
+/// Implementers must ensure the checksum is properly calculated before writing to guest memory.
 pub trait Sdt {
-    /// Get the length of the table
+    /// Get the total length of the table in bytes
+    ///
+    /// This includes the header and all table-specific data
     fn len(&self) -> usize;
 
-    /// Return true if Sdt is empty
+    /// Check if the table is empty
+    ///
+    /// Returns true if the table length is zero (which should never happen for valid tables)
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Write the table in guest memory
+    /// Write the complete table to guest memory at the specified address
+    ///
+    /// # Arguments
+    /// * `mem` - The guest memory region to write to
+    /// * `address` - The guest physical address where the table should be written
+    ///
+    /// # Errors
+    /// Returns `AcpiError::GuestMemory` if writing to guest memory fails
     fn write_to_guest<M: GuestMemory>(&mut self, mem: &M, address: GuestAddress) -> Result<()>;
 }
 

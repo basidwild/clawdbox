@@ -36,7 +36,13 @@ pub struct Rsdp {
 }
 
 impl Rsdp {
+    /// RSDP structure size for checksum calculation
+    const RSDP_CHECKSUM_LENGTH: usize = 20;
+    
     pub fn new(oem_id: [u8; 6], xsdt_addr: u64) -> Self {
+        // Performance optimization: Use const size expression
+        const RSDP_SIZE: u32 = std::mem::size_of::<Rsdp>() as u32;
+        
         let mut rsdp = Rsdp {
             // Space in the end of string is needed!
             signature: *b"RSD PTR ",
@@ -44,13 +50,13 @@ impl Rsdp {
             oem_id,
             revision: 2,
             rsdt_addr: U32::ZERO,
-            length: U32::new(std::mem::size_of::<Rsdp>().try_into().unwrap()),
+            length: U32::new(RSDP_SIZE),
             xsdt_addr: U64::new(xsdt_addr),
             extended_checksum: 0,
             reserved: [0u8; 3],
         };
 
-        rsdp.checksum = checksum(&[&rsdp.as_bytes()[..20]]);
+        rsdp.checksum = checksum(&[&rsdp.as_bytes()[..Self::RSDP_CHECKSUM_LENGTH]]);
         rsdp.extended_checksum = checksum(&[rsdp.as_bytes()]);
         rsdp
     }

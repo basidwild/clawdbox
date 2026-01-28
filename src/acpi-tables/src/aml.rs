@@ -77,7 +77,8 @@ impl Aml for Path {
             }
             n => {
                 bytes.push(0x2f); // MultiNamePrefix
-                bytes.push(n.try_into().unwrap());
+                let count: u8 = n.try_into().map_err(|_| AmlError::InvalidPartLength)?;
+                bytes.push(count);
             }
         };
 
@@ -182,13 +183,21 @@ pub struct Package<'a> {
 
 impl Aml for Package<'_> {
     fn append_aml_bytes(&self, bytes: &mut Vec<u8>) -> Result<(), AmlError> {
-        let mut tmp = vec![self.children.len().try_into().unwrap()];
+        // Performance optimization: Pre-allocate capacity for typical package size
+        let mut tmp = Vec::with_capacity(16 + self.children.len() * 4);
+        let num_children: u8 = self
+            .children
+            .len()
+            .try_into()
+            .map_err(|_| AmlError::InvalidPartLength)?;
+        tmp.push(num_children);
         for child in &self.children {
             child.append_aml_bytes(&mut tmp)?;
         }
 
         let pkg_length = create_pkg_length(&tmp, true);
 
+        bytes.reserve(3 + pkg_length.len() + tmp.len());
         bytes.push(0x12); // PackageOp
         bytes.extend_from_slice(&pkg_length);
         bytes.extend_from_slice(&tmp);
@@ -338,7 +347,8 @@ pub struct ResourceTemplate<'a> {
 
 impl Aml for ResourceTemplate<'_> {
     fn append_aml_bytes(&self, bytes: &mut Vec<u8>) -> Result<(), AmlError> {
-        let mut tmp = Vec::new();
+        // Performance optimization: Pre-allocate for typical resource template
+        let mut tmp = Vec::with_capacity(64 + self.children.len() * 16);
         // Add buffer data
         for child in &self.children {
             child.append_aml_bytes(&mut tmp)?;
@@ -359,6 +369,7 @@ impl Aml for ResourceTemplate<'_> {
         // PkgLength is everything else
         let pkg_length = create_pkg_length(&tmp, true);
 
+        bytes.reserve(1 + pkg_length.len() + tmp.len());
         bytes.push(0x11); // BufferOp
         bytes.extend_from_slice(&pkg_length);
         bytes.extend_from_slice(&tmp);
@@ -477,59 +488,34 @@ where
     }
 }
 
-impl Aml for AddressSpace<u16> {
-    fn append_aml_bytes(&self, bytes: &mut Vec<u8>) -> Result<(), AmlError> {
-        self.push_header(
-            bytes,
-            0x88,                               // Word Address Space Descriptor
-            3 + 5 * std::mem::size_of::<u16>(), // 3 bytes of header + 5 u16 fields
-        );
+// Helper macro to reduce code duplication for AddressSpace implementations
+macro_rules! impl_address_space {
+    ($type:ty, $descriptor:expr) => {
+        impl Aml for AddressSpace<$type> {
+            fn append_aml_bytes(&self, bytes: &mut Vec<u8>) -> Result<(), AmlError> {
+                const FIELD_SIZE: usize = std::mem::size_of::<$type>();
+                self.push_header(
+                    bytes,
+                    $descriptor,
+                    3 + 5 * FIELD_SIZE, // 3 bytes of header + 5 fields
+                );
 
-        bytes.extend_from_slice(&0u16.to_le_bytes()); // Granularity
-        bytes.extend_from_slice(&self.min.to_le_bytes()); // Min
-        bytes.extend_from_slice(&self.max.to_le_bytes()); // Max
-        bytes.extend_from_slice(&0u16.to_le_bytes()); // Translation
-        let len = self.max - self.min + 1;
-        bytes.extend_from_slice(&len.to_le_bytes()); // Length
-        Ok(())
-    }
+                bytes.extend_from_slice(&<$type>::default().to_le_bytes()); // Granularity
+                bytes.extend_from_slice(&self.min.to_le_bytes()); // Min
+                bytes.extend_from_slice(&self.max.to_le_bytes()); // Max
+                bytes.extend_from_slice(&<$type>::default().to_le_bytes()); // Translation
+                let len = self.max - self.min + 1;
+                bytes.extend_from_slice(&len.to_le_bytes()); // Length
+                Ok(())
+            }
+        }
+    };
 }
 
-impl Aml for AddressSpace<u32> {
-    fn append_aml_bytes(&self, bytes: &mut Vec<u8>) -> Result<(), AmlError> {
-        self.push_header(
-            bytes,
-            0x87,                               // DWord Address Space Descriptor
-            3 + 5 * std::mem::size_of::<u32>(), // 3 bytes of header + 5 u32 fields
-        );
-
-        bytes.extend_from_slice(&0u32.to_le_bytes()); // Granularity
-        bytes.extend_from_slice(&self.min.to_le_bytes()); // Min
-        bytes.extend_from_slice(&self.max.to_le_bytes()); // Max
-        bytes.extend_from_slice(&0u32.to_le_bytes()); // Translation
-        let len = self.max - self.min + 1;
-        bytes.extend_from_slice(&len.to_le_bytes()); // Length
-        Ok(())
-    }
-}
-
-impl Aml for AddressSpace<u64> {
-    fn append_aml_bytes(&self, bytes: &mut Vec<u8>) -> Result<(), AmlError> {
-        self.push_header(
-            bytes,
-            0x8A,                               // QWord Address Space Descriptor
-            3 + 5 * std::mem::size_of::<u64>(), // 3 bytes of header + 5 u64 fields
-        );
-
-        bytes.extend_from_slice(&0u64.to_le_bytes()); // Granularity
-        bytes.extend_from_slice(&self.min.to_le_bytes()); // Min
-        bytes.extend_from_slice(&self.max.to_le_bytes()); // Max
-        bytes.extend_from_slice(&0u64.to_le_bytes()); // Translation
-        let len = self.max - self.min + 1;
-        bytes.extend_from_slice(&len.to_le_bytes()); // Length
-        Ok(())
-    }
-}
+// Performance optimization: Use macro to reduce code duplication
+impl_address_space!(u16, 0x88); // Word Address Space Descriptor
+impl_address_space!(u32, 0x87); // DWord Address Space Descriptor
+impl_address_space!(u64, 0x8A); // QWord Address Space Descriptor
 
 pub struct Io {
     min: u16,

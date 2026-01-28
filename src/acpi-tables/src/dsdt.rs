@@ -26,11 +26,13 @@ impl Dsdt {
         oem_revision: u32,
         definition_block: Vec<u8>,
     ) -> Self {
+        // Performance optimization: Use const size and avoid unwrap
+        const HEADER_SIZE: usize = size_of::<SdtHeader>();
+        let total_size = (HEADER_SIZE + definition_block.len()) as u32;
+        
         let header = SdtHeader::new(
             *b"DSDT",
-            (size_of::<SdtHeader>() + definition_block.len())
-                .try_into()
-                .unwrap(),
+            total_size,
             2,
             oem_id,
             oem_table_id,

@@ -28,16 +28,19 @@ impl Xsdt {
         oem_revision: u32,
         tables: Vec<u64>,
     ) -> Self {
+        // Performance optimization: Pre-allocate exact capacity needed
         let mut tables_bytes = Vec::with_capacity(8 * tables.len());
         for addr in tables {
-            tables_bytes.extend(&addr.to_le_bytes());
+            tables_bytes.extend_from_slice(&addr.to_le_bytes());
         }
 
+        // Performance optimization: Use const size
+        const HEADER_SIZE: usize = std::mem::size_of::<SdtHeader>();
+        let total_size = (HEADER_SIZE + tables_bytes.len()) as u32;
+        
         let header = SdtHeader::new(
             *b"XSDT",
-            (std::mem::size_of::<SdtHeader>() + tables_bytes.len())
-                .try_into()
-                .unwrap(),
+            total_size,
             1,
             oem_id,
             oem_table_id,
