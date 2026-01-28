@@ -85,6 +85,12 @@ FC_ROOT_DIR=$(cd "${FC_TOOLS_DIR}/.." && pwd)
 # Full path to the build dir on the host.
 FC_BUILD_DIR="${FC_ROOT_DIR}/build"
 
+# Cache file for Docker image checks (performance optimization)
+DOCKER_CACHE_FILE="${FC_BUILD_DIR}/.docker_image_cache"
+
+# Performance mode flag (disable with --legacy-mode)
+PERF_MODE=${PERF_MODE:-1}
+
 # Full path to devctr dir on the host.
 FC_DEVCTR_DIR="${FC_ROOT_DIR}/tools/devctr"
 
@@ -222,6 +228,15 @@ ensure_devctr() {
     # We depend on having Docker present.
     ensure_docker
 
+    # Performance optimization: Check cache first to avoid repeated docker image queries
+    if [ "$PERF_MODE" = "1" ] && [ -f "$DOCKER_CACHE_FILE" ]; then
+        cached_image=$(cat "$DOCKER_CACHE_FILE" 2>/dev/null)
+        if [ "$cached_image" = "$DEVCTR_IMAGE" ]; then
+            # Image was verified in this session, skip check
+            return 0
+        fi
+    fi
+
     # Check if we have the container image available locally. Attempt to
     # download it, if we don't.
     [[ $(docker images -q "$DEVCTR_IMAGE" | wc -l) -gt 0 ]] || {
@@ -233,16 +248,31 @@ ensure_devctr() {
 
         ok_or_die "Error pulling docker image. Aborting."
     }
+
+    # Cache the verified image for performance
+    if [ "$PERF_MODE" = "1" ]; then
+        mkdir -p "$(dirname "$DOCKER_CACHE_FILE")"
+        echo "$DEVCTR_IMAGE" > "$DOCKER_CACHE_FILE"
+    fi
 }
 
 # Make sure the build/ dirs are available. Exit if we can't create them.
 # Upon returning from this call, the caller can be certain the build/ dirs exist.
 #
 ensure_build_dir() {
-    for dir in "$FC_BUILD_DIR" "$CARGO_TARGET_DIR" \
-               "$CARGO_REGISTRY_DIR" "$CARGO_GIT_REGISTRY_DIR"; do
-        create_dir "$dir"
-    done
+    if [ "$PERF_MODE" = "1" ]; then
+        # Performance optimization: Create directories in parallel
+        printf "%s\n" "$FC_BUILD_DIR" "$CARGO_TARGET_DIR" \
+               "$CARGO_REGISTRY_DIR" "$CARGO_GIT_REGISTRY_DIR" | \
+        xargs -P 4 -I {} bash -c 'mkdir -p "{}" 2>/dev/null && chmod +x+w "{}" 2>/dev/null || exit 1'
+        ok_or_die "Error: cannot create required build directories"
+    else
+        # Legacy mode: sequential directory creation
+        for dir in "$FC_BUILD_DIR" "$CARGO_TARGET_DIR" \
+                   "$CARGO_REGISTRY_DIR" "$CARGO_GIT_REGISTRY_DIR"; do
+            create_dir "$dir"
+        done
+    fi
 }
 
 build_bin_path() {
@@ -258,8 +288,17 @@ build_bin_path() {
 # to the current user.
 #
 cmd_fix_perms() {
-    # Yes, running Docker to get elevated privileges, just to chown some files
-    # is a dirty hack.
+    if [ "$PERF_MODE" = "1" ]; then
+        # Performance optimization: Try native chown first if we have sudo access
+        # This avoids spinning up a Docker container
+        if sudo -n true 2>/dev/null; then
+            sudo chown -f -R "$(id -u):$(id -g)" "$FC_BUILD_DIR" test_results 2>/dev/null || true
+            [ $# -gt 0 ] && sudo chown -f -R "$(id -u):$(id -g)" "$@" 2>/dev/null || true
+            return 0
+        fi
+    fi
+    
+    # Fallback: Use Docker to get elevated privileges (original behavior)
     run_devctr \
         --workdir "$CTR_FC_ROOT_DIR" \
         -- \
@@ -332,6 +371,17 @@ run_devctr() {
         fi
     done
 
+    # Performance optimization: Add Cargo optimization environment variables
+    if [ "$PERF_MODE" = "1" ]; then
+        docker_args+=("--env" "CARGO_INCREMENTAL=1")
+        docker_args+=("--env" "CARGO_TERM_COLOR=always")
+        docker_args+=("--env" "CARGO_NET_GIT_FETCH_WITH_CLI=true")
+        # Use sparse registry protocol for faster dependency resolution (Cargo 1.68+)
+        docker_args+=("--env" "CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse")
+        # Add parallel job count based on CPU cores
+        docker_args+=("--env" "CARGO_BUILD_JOBS=$(nproc 2>/dev/null || echo 4)")
+    fi
+
     # Finally, run the dev container
     # Use 'z' on the --volume parameter for docker to automatically relabel the
     # content and allow sharing between containers.
@@ -378,6 +428,8 @@ cmd_help() {
     echo "Global arguments"
     echo "    -y, --unattended         Run unattended. Assume the user would always"
     echo "                             answer \"yes\" to any confirmation prompt."
+    echo "    --legacy-mode            Disable performance optimizations. Use this if you"
+    echo "                             encounter issues with the optimized code paths."
     echo ""
     echo "Available commands:"
     echo ""
@@ -485,6 +537,18 @@ cmd_help() {
 
     checkbuild [--all|-m x86_64|aarch64]
         Run cargo check on the target architecture (supports cross compilation).
+
+    start_persist_devctr [--privileged]
+        Start a persistent development container for reuse across commands.
+        This is a performance optimization to avoid container startup overhead.
+        -p, --privileged    Run the container as root, in privileged mode.
+
+    stop_persist_devctr
+        Stop and remove the persistent development container.
+
+    exec_persist CMD...
+        Execute a command in the persistent development container.
+        The persistent container must be started first with start_persist_devctr.
 EOF
 }
 
@@ -595,6 +659,9 @@ function cmd_make_release {
 }
 
 cmd_distclean() {
+    # Stop persistent container if running
+    cmd_stop_persist_devctr 2>/dev/null || true
+    
     # List of folders to remove.
     dirs=("build" "test_results")
 
@@ -675,7 +742,22 @@ download_ci_artifacts() {
     if [ ! -d "$local_artifacts_path" ]; then
         say "Fetching artifacts from S3: " $artifacts_arch " into: " $local_artifacts_path
         mkdir -pv $local_artifacts_path
-        aws s3 sync --no-sign-request "$artifacts_arch" "$local_artifacts_path"
+        
+        # Performance optimization: Enhanced S3 sync with parallel downloads
+        if [ "$PERF_MODE" = "1" ]; then
+            # Use increased concurrency for faster parallel downloads
+            # Set reasonable timeouts to handle network issues
+            aws s3 sync --no-sign-request \
+                --cli-read-timeout 300 \
+                --cli-connect-timeout 60 \
+                --max-concurrent-requests 20 \
+                --max-bandwidth 100MB \
+                "$artifacts_arch" "$local_artifacts_path"
+        else
+            # Legacy mode: standard sync
+            aws s3 sync --no-sign-request "$artifacts_arch" "$local_artifacts_path"
+        fi
+        
         ok_or_die "Failed to download artifacts using awscli!"
         cmd_sh "./tools/setup-ci-artifacts.sh" $local_artifacts_path
         if [ $? != 0 ]; then
@@ -835,15 +917,42 @@ cmd_test() {
     done
 
     # Check prerequisites.
-    [ $do_kvm_check != 0 ] && ensure_kvm
-    ensure_devctr
-    [ $do_build_dir_check != 0 ] && ensure_build_dir
-    if [ $do_artifacts_check != 0 ]; then
-      if [ -z $artifacts ]; then
-        cmd_ensure_current_artifacts
-      else
-        cmd_ensure_current_artifacts $artifacts
-      fi
+    if [ "$PERF_MODE" = "1" ]; then
+        # Performance optimization: Run independent checks in parallel
+        [ $do_kvm_check != 0 ] && ensure_kvm &
+        kvm_pid=$!
+        
+        ensure_devctr &
+        devctr_pid=$!
+        
+        [ $do_build_dir_check != 0 ] && ensure_build_dir &
+        builddir_pid=$!
+        
+        # Wait for parallel checks to complete
+        [ ! -z "$kvm_pid" ] && wait $kvm_pid
+        wait $devctr_pid || die "Failed to ensure dev container"
+        [ ! -z "$builddir_pid" ] && wait $builddir_pid
+        
+        # Artifacts check runs after others complete (depends on build dir)
+        if [ $do_artifacts_check != 0 ]; then
+          if [ -z $artifacts ]; then
+            cmd_ensure_current_artifacts
+          else
+            cmd_ensure_current_artifacts $artifacts
+          fi
+        fi
+    else
+        # Legacy mode: sequential checks
+        [ $do_kvm_check != 0 ] && ensure_kvm
+        ensure_devctr
+        [ $do_build_dir_check != 0 ] && ensure_build_dir
+        if [ $do_artifacts_check != 0 ]; then
+          if [ -z $artifacts ]; then
+            cmd_ensure_current_artifacts
+          else
+            cmd_ensure_current_artifacts $artifacts
+          fi
+        fi
     fi
 
     if [ $do_build != 0 ]; then
@@ -1022,6 +1131,94 @@ cmd_sh() {
         --workdir "$CTR_FC_ROOT_DIR" \
         -- \
         bash --norc -c "$*"
+}
+
+# Performance optimization: Persistent dev container commands
+PERSIST_CTR_NAME="clawdbox-dev-persist"
+
+cmd_start_persist_devctr() {
+    privileged=false
+    
+    # Parse arguments
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            "-h"|"--help")          { cmd_help; exit 1; } ;;
+            "-p"|"--privileged")    { privileged=true;  } ;;
+            *)
+                die "Unknown argument: $1. Please use --help for help."
+            ;;
+        esac
+        shift
+    done
+    
+    # Check if container already exists
+    if docker ps -a --format '{{.Names}}' | grep -q "^${PERSIST_CTR_NAME}$"; then
+        say_warn "Persistent container '$PERSIST_CTR_NAME' already exists. Stopping it first..."
+        cmd_stop_persist_devctr
+    fi
+    
+    ensure_devctr
+    ensure_build_dir
+    
+    docker_args=()
+    [ "$privileged" = true ] && docker_args+=("--privileged")
+    
+    # Try to pass proxy environments
+    proxies=(http_proxy HTTP_PROXY https_proxy HTTPS_PROXY no_proxy NO_PROXY)
+    for i in "${proxies[@]}"; do
+        if [[ ! -z ${!i} ]]; then
+            docker_args+=("--env" "$i=${!i}")
+        fi
+    done
+    
+    # Add Cargo optimization environment variables
+    if [ "$PERF_MODE" = "1" ]; then
+        docker_args+=("--env" "CARGO_INCREMENTAL=1")
+        docker_args+=("--env" "CARGO_TERM_COLOR=always")
+        docker_args+=("--env" "CARGO_NET_GIT_FETCH_WITH_CLI=true")
+        docker_args+=("--env" "CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse")
+        docker_args+=("--env" "CARGO_BUILD_JOBS=$(nproc 2>/dev/null || echo 4)")
+    fi
+    
+    say "Starting persistent development container '$PERSIST_CTR_NAME'..."
+    docker run -d \
+        --name "$PERSIST_CTR_NAME" \
+        "${docker_args[@]}" \
+        --volume /dev:/dev \
+        --volume "$FC_ROOT_DIR:$CTR_FC_ROOT_DIR:z" \
+        --volume "$FC_ROOT_DIR/build/cargo_registry:/usr/local/rust/registry:z" \
+        --volume "$FC_ROOT_DIR/build/cargo_git_registry:/usr/local/rust/git:z" \
+        --tmpfs /srv:exec,dev,size=32G \
+        -v /boot:/boot \
+        --env PYTHONDONTWRITEBYTECODE=1 \
+        --ulimit nofile=4096:4096 \
+        --ulimit memlock=-1:-1 \
+        --workdir "$CTR_FC_ROOT_DIR" \
+        "$DEVCTR_IMAGE" \
+        tail -f /dev/null
+    
+    say "Persistent container started. Use 'exec_persist' to run commands in it."
+}
+
+cmd_stop_persist_devctr() {
+    if docker ps -a --format '{{.Names}}' | grep -q "^${PERSIST_CTR_NAME}$"; then
+        say "Stopping persistent container '$PERSIST_CTR_NAME'..."
+        docker stop "$PERSIST_CTR_NAME" >/dev/null 2>&1 || true
+        docker rm "$PERSIST_CTR_NAME" >/dev/null 2>&1 || true
+        say "Persistent container removed."
+    else
+        say "No persistent container found."
+    fi
+}
+
+cmd_exec_persist() {
+    # Check if container is running
+    if ! docker ps --format '{{.Names}}' | grep -q "^${PERSIST_CTR_NAME}$"; then
+        die "Persistent container '$PERSIST_CTR_NAME' is not running. Start it with 'start_persist_devctr' first."
+    fi
+    
+    # Execute command in the persistent container
+    docker exec -it "$PERSIST_CTR_NAME" bash --norc -c "$*"
 }
 
 cmd_sandbox() {
@@ -1268,6 +1465,11 @@ main() {
         case "$1" in
             -h|--help)              { cmd_help; exit 1;     } ;;
             -y|--unattended)        # purposefully ignored
+                ;;
+            --legacy-mode)
+                # Disable performance optimizations
+                export PERF_MODE=0
+                say_warn "Legacy mode enabled - performance optimizations disabled"
                 ;;
             -*)
                 die "Unknown arg: $1. Please use \`$0 help\` for help."

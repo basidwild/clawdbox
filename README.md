@@ -52,13 +52,13 @@ Clawdbox follows a modular, containerized architecture to ensure scalability and
 
 #### b. AI Core
 
-- **Technologies**: Python with Anthropic Claude API (or open-source alternatives like Llama)
+- **Technologies**: Rust with Anthropic Claude API (or open-source alternatives like Llama)
 - **Functionality**: Parses user intents, generates execution plans, and orchestrates multi-agent workflows. Uses prompt engineering for task decomposition (e.g., "Clean inbox" → API calls)
 - **Extensibility**: Supports custom prompts and fine-tuning for domain-specific tasks like Web3 (e.g., Solidity code generation)
 
 #### c. Sandbox Executor
 
-- **Technologies**: Docker for containerization; Python supervisors for process management
+- **Technologies**: Docker for containerization; Rust supervisors for process management
 - **Functionality**: Runs isolated environments for tools:
   - Browser automation: Puppeteer or Selenium in headless mode
   - Shell commands: Restricted bash in chroot-like setup
@@ -74,7 +74,7 @@ Clawdbox follows a modular, containerized architecture to ensure scalability and
 
 - **Email & Calendar**: IMAP/SMTP for emails; Google API/OAuth for calendars
 - **Travel Services**: Airline APIs (e.g., Amadeus) for check-ins
-- **Web3 Tools**: Web3.py or ethers.js for blockchain interactions; APIs like Coingecko, Etherscan
+- **Web3 Tools**: Web3 or ethers.js for blockchain interactions; APIs like Coingecko, Etherscan
 - **Browser & Automation**: Headless Chrome for web scraping/form filling
 - **Other**: GitHub API for code repos; Cron for scheduled tasks
 
@@ -87,8 +87,6 @@ Clawdbox follows a modular, containerized architecture to ensure scalability and
 5. AI formats response and sends back via Interface
 
 ### 4. Technology Stack
-
-- **Backend**: Python 3.10+, Flask/Django for API endpoints
 - **Containerization**: Docker Compose for local dev; Kubernetes for production scaling
 - **Databases**: SQLite for session state; Redis for caching
 - **AI/ML**: Anthropic Claude SDK; Optional Hugging Face for local models
@@ -101,7 +99,6 @@ Clawdbox follows a modular, containerized architecture to ensure scalability and
 ### Prerequisites
 
 - Docker
-- Python 3.10+
 - API keys (Claude, Telegram, etc.)
 
 ### Steps
@@ -122,7 +119,11 @@ Clawdbox follows a modular, containerized architecture to ensure scalability and
 
 4. **Run the application**:
    ```bash
-   python main.py
+   # Build debug version (default)
+   ./tools/devtool build
+
+   # Build release version
+   ./tools/devtool build --release
    ```
 
 ## Development & Contribution
@@ -133,13 +134,12 @@ Clawdbox follows a modular, containerized architecture to ensure scalability and
 /src/interface/  - Chat bot handlers
 /src/core/       - AI logic and planners
 /src/sandbox/    - Docker wrappers and tool executors
-/tools/          - Modular integrations (e.g., email.py, web3.py)
+/tools/          - Modular integrations
 ```
 
 ### Contributing
 
 - Fork the repository and create pull requests
-- Follow PEP8 for Python code
 
 ### License
 
@@ -148,5 +148,3 @@ MIT License
 ## Support
 
 For issues or enhancements, please open a GitHub issue.
-
-**Contact**: support@clawdbox.com

@@ -122,6 +122,10 @@ if [ "$PROFILE" = "release" ]; then
     CARGO_OPTS+=" --release"
 fi
 
+# Performance optimization: Add parallel jobs flag
+NPROC=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
+CARGO_OPTS+=" --jobs $NPROC"
+
 ARTIFACTS=(clawdbox jailer seccompiler-bin rebase-snap cpu-template-helper snapshot-editor)
 
 if [ "$LIBC" == "gnu" ]; then
