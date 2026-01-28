@@ -1,4 +1,5 @@
 # Clawdbox: Secure Sandbox for Clawdbot AI Assistant
+![abc2](https://github.com/user-attachments/assets/f1b98c62-1dff-4635-8443-2b12adbc4fe7)
 
 ## Overview
 
