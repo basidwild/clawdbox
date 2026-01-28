@@ -37,6 +37,7 @@ Clawdbox follows a modular, containerized architecture to ensure scalability and
 ```
 
 **Architecture Layers:**
+<img width="1500" height="500" alt="abc" src="https://github.com/user-attachments/assets/58e58e7b-7621-4bc2-8898-e87e62470f91" />
 
 - **Chat Interface Layer**: Handles incoming messages from users via bot APIs
 - **AI Core Layer**: Processes natural language inputs using Claude AI for intent recognition and task planning
