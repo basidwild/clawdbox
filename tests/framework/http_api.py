@@ -84,24 +84,32 @@ class Resource:
 
         return res
 
-    def request(self, method, path, **kwargs):
-        """Make an HTTP request"""
+    def request(self, method: str, path: str, **kwargs):
+        """Make an HTTP request.
+        
+        Performance optimization: More specific exception handling.
+        
+        Args:
+            method: HTTP method (GET, POST, PUT, etc.)
+            path: API path
+            **kwargs: Request parameters
+        """
+        # Performance optimization: Filter None values inline
         kwargs = {key: val for key, val in kwargs.items() if val is not None}
         url = self._api.endpoint + path
+        
         try:
             res = self._api.session.request(method, url, json=kwargs)
-        except Exception as e:
+        except (requests.RequestException, OSError) as e:
             if self._api.error_callback:
                 self._api.error_callback(method, path, str(e))
             raise
+        
         if res.status_code != HTTPStatus.NO_CONTENT:
-            json = res.json()
-            msg = res.content
-            if "fault_message" in json:
-                msg = json["fault_message"]
-            elif "error" in json:
-                msg = json["error"]
-            raise RuntimeError(msg, json, res)
+            response_json = res.json()
+            # Performance optimization: Use dict.get() to avoid double lookup
+            msg = response_json.get("fault_message") or response_json.get("error") or res.content
+            raise RuntimeError(msg, response_json, res)
 
         # Validate request against Swagger specification
         # do this after the actual request as we only want to validate successful

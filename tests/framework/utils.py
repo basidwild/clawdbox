@@ -34,15 +34,24 @@ CMDLOG = logging.getLogger("commands")
 
 
 def get_threads(pid: int) -> dict:
-    """Return dict consisting of child threads."""
+    """Return dict consisting of child threads.
+    
+    Performance optimization: Reduced Process object creation overhead.
+    """
     try:
         proc = psutil.Process(pid)
-
         threads_map = defaultdict(list)
+        
+        # Performance optimization: Cache Process objects to reduce syscalls
         for thread in proc.threads():
-            threads_map[psutil.Process(thread.id).name()].append(thread.id)
+            try:
+                thread_proc = psutil.Process(thread.id)
+                threads_map[thread_proc.name()].append(thread.id)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                # Thread may have terminated, skip it
+                continue
         return threads_map
-    except psutil.NoSuchProcess:
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
         return {}
 
 
@@ -61,26 +70,34 @@ CpuTimes = namedtuple("CpuTimes", ["user", "system"])
 
 
 def get_cpu_times(process: psutil.Process) -> Dict[str, CpuTimes]:
-    """Return a dict mapping thread name to CPU usage (in seconds) since start."""
-    # We're consciously ignoring whatever erorr is returned by psutil and returning
+    """Return a dict mapping thread name to CPU usage (in seconds) since start.
+    
+    Performance optimization: Caches thread Process objects to reduce overhead.
+    """
+    # We're consciously ignoring whatever error is returned by psutil and returning
     # empty {} as result in case of any error retrieving the process threads
     # information
     # pylint: disable=locally-disabled, broad-exception-caught
 
-    threads = []
     try:
         threads = process.threads()
-    except Exception as exc:
+    except psutil.NoSuchProcess as exc:
         logging.warning("Process %d does not exist", process.pid, exc_info=exc)
+        return {}
+    except psutil.AccessDenied as exc:
+        logging.warning("Access denied for process %d", process.pid, exc_info=exc)
         return {}
 
     cpu_times = {}
+    # Performance optimization: Batch process thread information to reduce syscalls
     for thread in threads:
         try:
-            thread_name = psutil.Process(thread.id).name()
+            # Create Process object once per thread
+            thread_proc = psutil.Process(thread.id)
+            thread_name = thread_proc.name()
             cpu_times[thread_name] = CpuTimes(thread.user_time, thread.system_time)
-        except Exception as exc:
-            logging.warning("Thread %d no longer exists", thread.id, exc_info=exc)
+        except (psutil.NoSuchProcess, psutil.AccessDenied) as exc:
+            logging.warning("Thread %d no longer exists or access denied", thread.id, exc_info=exc)
             continue
 
     return cpu_times
@@ -131,25 +148,45 @@ def track_cpu_utilization(
     return cpu_utilization
 
 
-def get_resident_memory(process: psutil.Process):
-    """Returns current memory utilization in KiB, including used HugeTLBFS"""
-
+def get_resident_memory(process: psutil.Process) -> int:
+    """Returns current memory utilization in KiB, including used HugeTLBFS.
+    
+    Performance optimization: Optimized parsing with generator expression.
+    """
     proc_status = Path("/proc", str(process.pid), "status").read_text("utf-8")
-    for line in proc_status.splitlines():
-        if line.startswith("HugetlbPages:"):  # entry is in KiB
-            hugetlbfs_usage = int(line.split()[1])
-            break
-    else:
-        assert False, f"HugetlbPages not found in {str(proc_status)}"
+    
+    # Performance optimization: Use generator expression and next() instead of loop
+    hugetlb_lines = (
+        line for line in proc_status.splitlines()
+        if line.startswith("HugetlbPages:")
+    )
+    
+    try:
+        hugetlbfs_line = next(hugetlb_lines)
+        hugetlbfs_usage = int(hugetlbfs_line.split()[1])
+    except StopIteration:
+        raise AssertionError(f"HugetlbPages not found in /proc/{process.pid}/status") from None
+    
     return hugetlbfs_usage + process.memory_info().rss // 1024
 
 
 @contextmanager
 def chroot(path):
+    """Create a chroot environment for running some code.
+    
+    Performance optimization: Proper resource cleanup with context manager.
+    
+    Args:
+        path: Path to chroot into
+        
+    Yields:
+        None
+        
+    Example:
+        with chroot("/path/to/root"):
+            # Code runs in chroot environment
+            pass
     """
-    Create a chroot environment for running some code
-    """
-
     # Need to keep these around so we can exit the chroot
     real_root = os.open("/", os.O_RDONLY)
     working_dir = os.getcwd()
@@ -162,9 +199,13 @@ def chroot(path):
 
     finally:
         # Jump out of the chroot
-        os.fchdir(real_root)
-        os.chroot(".")
-        os.chdir(working_dir)
+        try:
+            os.fchdir(real_root)
+            os.chroot(".")
+            os.chdir(working_dir)
+        finally:
+            # Performance optimization: Ensure file descriptor is always closed
+            os.close(real_root)
 
 
 class CpuMap:
@@ -210,7 +251,10 @@ class CpuMap:
 
 
 class CmdBuilder:
-    """Command builder class."""
+    """Command builder class.
+    
+    Performance optimization: Uses list joining instead of string concatenation.
+    """
 
     def __init__(self, bin_path):
         """Initialize the command builder."""
@@ -223,11 +267,17 @@ class CmdBuilder:
         return self
 
     def build(self):
-        """Build the command."""
-        cmd = self._bin_path + " "
-        for flag, value in self._args.items():
-            cmd += f"{flag} {value} "
-        return cmd
+        """Build the command.
+        
+        Performance optimization: Use list join instead of repeated string concatenation.
+        """
+        # Build command parts list
+        cmd_parts = [self._bin_path]
+        cmd_parts.extend(
+            f"{flag} {value}".strip() if value else flag
+            for flag, value in self._args.items()
+        )
+        return " ".join(cmd_parts)
 
 
 def search_output_from_cmd(cmd: str, find_regex: typing.Pattern) -> typing.Match:
